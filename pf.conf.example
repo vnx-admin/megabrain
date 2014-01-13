@@ -1,0 +1,66 @@
+#	$OpenBSD: pf.conf
+#
+# See pf.conf(5) for syntax and examples.
+# Remember to set net.inet.ip.forwarding=1 and/or net.inet6.ip6.forwarding=1
+# in /etc/sysctl.conf if packets are to be forwarded between interfaces.
+
+local_if="vlan4"
+local_ip="192.168.1.1/32"
+local_net="192.168.1.0/24"
+
+serv_if="vlan128"
+serv_ip="192.168.128.1/32"
+serv_net="192.168.128.0/27"
+
+ext_if1="vlan101"
+ext_ip1="1.1.1.1/32"
+ext_net1="1.1.1.0/29"
+
+ext_if2="pppoe0"
+ext_ip2="1.2.3.4/32"
+ext_net2="1.2.3.4/32"
+
+ext_if3="pppoe1"
+ext_ip3="(pppoe1)"
+ext_net3="(pppoe1)"
+
+virt_if="vether0"
+virt_ip="192.168.254.1/32"
+virt_net="192.168.254.0/30"
+
+allowed_icmp_types="{ echoreq, unreach }"
+
+any_ip="0.0.0.0/0"
+ssh_ip="192.168.1.1/32"
+
+proxy_ip="192.168.128.2/32"
+proxy_if=$serv_if
+
+table <users> persist {192.168.1.0/24}
+table <dns> const {192.168.1.25,192.168.1.30}
+
+set skip on lo
+set block-policy return
+
+block all
+
+pass in on $local_if proto tcp from <users> to !<all_nets> port 80 rdr-to $proxy_ip port 8080
+pass in on $serv_if proto tcp from $serv_net to !<all_nets> port {1111 2222} rtable 2 label "sp_res"
+pass in on $proxy_if proto tcp from $proxy_ip to !<all_nets> port 80 rtable 1 label "local_http"
+
+pass out on $virt_if from $virt_ip to !<all_nets> rtable 1 nat-to $ext_if1 label "self_all"
+
+pass in on $serv_if proto {tcp udp} from $serv_net to <dns> port 53
+pass out on $local_if proto {tcp udp} from $serv_net to <dns> port 53
+
+pass out on $ext_if1 from {$local_net $serv_net} nat-to $ext_ip1
+pass out on $ext_if2 from {$local_net $serv_net} nat-to $ext_ip2
+pass out on $ext_if3 from {$local_net $serv_net} nat-to $ext_ip3
+
+pass in log on $ext_if1 proto tcp from $any_ip to $ext_ip1 port 10101 rdr-to $ssh_ip port 22 rtable 0
+pass in log on $ext_if2 proto tcp from $any_ip to $ext_ip2 port 10101 rdr-to $ssh_ip port 22 rtable 0
+pass in log on $ext_if3 proto tcp from $any_ip to $ext_ip3 port 10101 rdr-to $ssh_ip port 22 rtable 0
+
+pass proto icmp from $any_ip to $ext_ip1 icmp-type $allowed_icmp_types
+pass proto icmp from $any_ip to $ext_ip2 icmp-type $allowed_icmp_types
+pass proto icmp from $any_ip to $ext_ip3 icmp-type $allowed_icmp_types

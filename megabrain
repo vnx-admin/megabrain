@@ -1,0 +1,293 @@
+#!/usr/local/bin/python
+from pf import *
+import time
+import os
+import socket
+import re
+import random
+import threading
+import sys
+import datetime
+import ping
+import openbsd
+import ConfigParser
+
+def logger(host,text):
+	m=datetime.datetime.now().strftime('[%H:%M:%S] ')+text+'\n'
+	f=open('/var/log/megabrain/'+datetime.datetime.now().strftime('%Y.%m.%d_')+host+'.log','a')
+	f.write(m)
+	f.close()
+
+def p_thread (wconfig,addrs,ips,timings):
+	ping_i=0
+	ping_route_i=0
+	tester_iter=0
+	while 1:
+		sl=random.uniform(1,10)
+		x=addrs[random.randint(0,len(addrs)-1)]
+		res=ping.checkit(x,wconfig['rtable'])
+		if res:
+			tester_iter=0
+			if res==1:
+				logger(wconfig['name'],'Nothig received from '+x)
+				sl=timings['no_ping_t2t']
+				ping_i=ping_i+1
+				if ping_i == timings['no_ping_not']:
+					sl=timings['no_ping_pt']
+					logger(wconfig['name'],'Nothig received for '+str(timings['no_ping_not'])+' times, last was '+x+', turning channel off, sleeping for '+str(sl)+' sec')
+					events[wconfig['id']].set()
+				if ping_i > timings['no_ping_not']:
+					if wconfig['type']=='pppoe':
+						logger(wconfig['name'],'Type is PPPoE. Restarting connection.')
+						ifconf[wconfig['iface']].flags=0
+						logger(wconfig['name'],'Stopped')
+						time.sleep(1)
+						ifconf[wconfig['iface']].flags=1
+						logger(wconfig['name'],'Started. Waiting '+str(timings['pppoe_restart_time'])+' seconds.')
+						sl=timings['pppoe_restart_time']
+					ping_i = 0
+			elif res==2:
+				logger(wconfig['name'],'Could not resolve DNS name of '+x+'nothing was done.')
+			elif (res==3) or (res==4):
+				logger(wconfig['name'],'No route to host')
+				ping_route_i=ping_route_i+1
+				sl=timings['no_route_t2t']
+				if ping_route_i == timings['no_route_not']:
+					sl=timings['no_route_pt']
+					events[wconfig['id']].set()
+					logger(wconfig['name'],'No route to host for '+str(timings['no_route_not'])+' times, turning channel off, sleeping for '+str(sl)+' sec')
+				if ping_route_i > timings['no_route_not']:
+					if wconfig['type']=='pppoe':
+						logger(wconfig['name'],'Type is PPPoE. Restarting connection.')
+						ifconf[wconfig['iface']].flags=0
+						logger(wconfig['name'],'Stopped')
+						time.sleep(1)
+						ifconf[wconfig['iface']].flags=1
+						logger(wconfig['name'],'Started')
+						sl=timings['pppoe_restart_time']
+					ping_route_i=0
+			elif res==999:
+				logger(wconfig['name'],'Pinger did nothing')
+		else:
+			ping_i=0
+			ping_route_i=0
+			if events[wconfig['id']].is_set():
+				tester_iter=tester_iter+1
+				logger(wconfig['name'],'Channel seems to be OK, testing it...'+str(tester_iter)+' is OK')
+				if tester_iter>=10:
+					logger(wconfig['name'],'Channel seems to be OK, turning it on')
+					events[wconfig['id']].clear()
+					tester_iter=0
+			else:
+				logger(wconfig['name'],'Channel is OK')
+		time.sleep(sl)
+
+def pf_get_current(pf,labels,wan):
+	pf_rules=pf.get_ruleset()
+	current_st={}
+	for l in labels.keys():
+		for r in xrange(len(pf_rules.rules)):
+			if pf_rules.rules[r].label==l:
+				for w in wan:
+					if pf_rules.rules[r].rtableid==w['rtable']:
+						current_st[l]=w['id']
+				break
+	return current_st
+def change_pf_rules(pf,labels_to_change):
+	pf_rules=pf.get_ruleset()
+	for l in labels_to_change:
+		for r in xrange(len(pf_rules.rules)):
+			if pf_rules.rules[r].label==l:
+				pf_rules.rules[r].rtableid=labels_to_change[l][0]
+				logger('main','Changed rtable for '+l+' -> '+str(labels_to_change[l][0]))
+				if l[0:5]=='self_':
+					pf_rules.rules[r].nat=PFPool(PF_POOL_NAT,PFAddr(type=PF_ADDR_DYNIFTL,ifname=labels_to_change[l][1]))
+					logger('main','Changed nat iface for '+l+' -> '+labels_to_change[l][1]) 
+	pf.load_ruleset(pf_rules)
+	
+def pf_thread (events,wan,prev_test,labels):
+	pf = PacketFilter()
+	man_events[1].set()
+	labels_table=[]
+	for w in wan:
+		labels_table.append({})
+		for l in labels.keys():
+			labels_table[w['id']][l]=labels[l].index(w['rtable'])
+	while 1:
+		for w in wan:
+			if prev_test[w['id']][0]==events[w['id']].is_set():
+				prev_test[w['id']][1]=False
+			else:
+				prev_test[w['id']][1]=True
+				prev_test[w['id']][0]=events[w['id']].is_set()
+				logger('main','State changed for '+w['name'])
+				if events[w['id']].is_set():
+					labels_to_change={}
+					logger('main',w['name']+' fault')
+					labels_current=pf_get_current(pf,labels,wan)
+					for l in labels:
+						if labels_current[l]==w['id']:
+							cur_label_ch_n=labels_table[w['id']][l]
+							for i in xrange(cur_label_ch_n,len(labels[l])-1):
+								if len(labels[l])==i:
+									logger('main',l+' has no more reserve chanels, nothing to change, '+w['name']+' was last working channel in list')
+									break
+								else:
+									for ww in wan:
+										if ww['rtable']==labels[l][i+1]:
+											break
+									if events[ww['id']].is_set():
+										continue
+									else:
+										labels_to_change[l]=[labels[l][i+1],ww['iface']]
+										break
+				else:
+					logger('main',w['name']+' is now OK')
+					labels_to_change={}
+					labels_current=pf_get_current(pf,labels,wan)
+					for l in labels:
+						for ww in wan:
+							if ww['id']==labels_current[l]:
+								break
+						if labels[l].index(w['rtable'])<labels[l].index(ww['rtable']):
+							labels_to_change[l]=[w['rtable'],w['iface']]
+				change_pf_rules(pf,labels_to_change)
+		time.sleep(0.1)
+		if not man_events[1].isSet():
+			logger('main',' Pausing pf_thread activity')
+			man_events[1].wait()
+			logger('main',' Resuming pf_thread activity')
+		
+def man_thread (p):
+	srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+	while 1:
+		try:
+			srv.bind(('192.168.1.1',p))
+			break
+		except socket.error, (errno):
+			if errno==48:
+				logger('main','Socket is used, retrying')
+			time.sleep(1)
+	logger('main','Port '+str(p)+' is listening...')
+	while 1:
+		srv.listen(1)
+		sock, addr = srv.accept()
+		res = sock.recv(1024)
+		if res=='exit':
+			result='OK'
+			try:
+				sock.send(result)
+			except:
+				pass
+			sock.close()
+			srv.close()
+			man_events[0].set()
+			break
+		elif res=='status':
+			result=''
+			for i in events:
+				if i.is_set():
+					result+='N'
+				else:
+					result+='Y'
+			sock.send(result)
+		elif res=='pause':
+			result='OK'
+			try:
+				sock.send(result)
+			except:
+				pass
+			man_events[1].clear()
+		elif res=='run':
+			result='OK'
+			try:
+				sock.send(result)
+			except:
+				pass
+			man_events[1].set()
+	sock.close()
+
+config = ConfigParser.RawConfigParser()
+conf_file='/etc/megabrain.conf'
+try:
+	config.readfp(open(conf_file))
+except:
+	print 'No configuration file '+conf_file
+	logger('main','No configuration file in /etc')
+	exit(1)
+	
+try:
+	port=config.getint('main','port')
+	addrs=config.get('main','hosts').split(',')
+	ips=config.get('main','ips').split(',')
+	labels={}
+	for i in config.get('labels','list').split(','):
+		labels[i]=map(int,config.get('labels',i).split(','))
+	wan=[]
+	for s in config.sections():
+		if s[0:4] == 'wan_':
+			wan.append({'id':config.getint(s,'id'),'name':config.get(s,'name'),'rtable':config.getint(s,'rtable'),'iface':config.get(s,'iface'),'gate':config.get(s,'gate'),'type':config.get(s,'type')})
+
+	timings={}
+	timings['no_ping_t2t']=config.getfloat('timings','no_ping_t2t')
+	timings['no_ping_pt']=config.getfloat('timings','no_ping_pt')
+	timings['no_ping_not']=config.getint('timings','no_ping_not')
+	timings['no_route_t2t']=config.getfloat('timings','no_route_t2t')
+	timings['no_route_pt']=config.getfloat('timings','no_route_pt')
+	timings['no_route_not']=config.getint('timings','no_route_not')
+	timings['pppoe_restart_time']=config.getfloat('timings','pppoe_restart_time')
+except:
+	print 'Error parsing configuration file '+conf_file
+	logger('main','Error parsing configuration file in /etc')
+	exit(1)
+
+ifconf=openbsd.ifconfig.IFConfig()
+
+events=[]
+p=[]
+prev_test=[]
+man_events=[]
+
+man_events.append(threading.Event())
+man_events.append(threading.Event())
+
+logger('main', 'Configuring pingers...')
+
+for i in wan:
+	events.append(threading.Event())
+	p.append(threading.Thread(target=p_thread,args=[i,addrs,ips,timings]))
+	prev_test.append([False,False])
+
+logger('main', 'Starting pingers...')
+	
+for i in p:
+	i.daemon=True
+	i.start()
+
+logger('main', 'Waiting 10 seconds...')
+
+for x in xrange(10):
+	time.sleep(1)
+
+logger('main', 'Starting PF thread...')
+pf_t=(threading.Thread(target=pf_thread,args=[events,wan,prev_test,labels]))
+pf_t.daemon=True
+pf_t.start()
+
+logger('main','Starting Management thread...')
+man_t=(threading.Thread(target=man_thread,args=[port]))
+man_t.daemon=True
+man_t.start()
+
+logger('main','Starting (v1.1b)')
+
+try:
+	while 1:
+		time.sleep(1)
+		if man_events[0].isSet():
+			logger('main','Cought exit, exiting.')
+			exit(0)
+except KeyboardInterrupt:
+	exit(0)
+except:
+	pass
