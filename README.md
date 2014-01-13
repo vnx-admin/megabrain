@@ -1,4 +1,4 @@
-pyPF and pyOpenBSD is requied.
+pyPF and pyOpenBSD are requied.
 
 pf.conf.example - example config for PF in OpenBSD.
 
